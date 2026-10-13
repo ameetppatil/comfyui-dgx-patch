@@ -1,0 +1,11 @@
+# The GPL source bundles produced by `make source`. They are release artefacts
+# built from a running image, reproducible on demand, and large.
+dist/
+
+__pycache__/
+*.pyc
+
+# macOS. These once reached the image and then the GPL source bundle, which is
+# junk to hand a third party — see the Makefile's sync target.
+.DS_Store
+._*

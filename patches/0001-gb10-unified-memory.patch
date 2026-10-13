@@ -1,0 +1,166 @@
+diff --git a/comfy/model_management.py b/comfy/model_management.py
+index 13b690bd..cd82b494 100644
+--- a/comfy/model_management.py
++++ b/comfy/model_management.py
+@@ -15,6 +15,32 @@
+     You should have received a copy of the GNU General Public License
+     along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ """
++
++# =============================================================================
++# NOTICE OF MODIFICATION  —  GNU General Public License v3, section 5(a)
++#
++# This file has been MODIFIED from the ComfyUI original.
++#
++#   Modified by:  Cromozo Ltd, via the shared `comfyui-patch` project
++#   Date:         2026-10-13
++#   Changes:      (1) memory accounting for a single CPU/GPU memory pool
++#                     (NVIDIA GB10 / Grace-Blackwell unified memory);
++#                 (2) detection of, and a workaround for, a cuDNN build whose
++#                     convolutions return incorrect results.
++#
++# The modifications are kept as unified diffs and are distributed with this
++# file at /opt/comfyui-patch/patches/. They are licensed under the GNU General
++# Public License, version 3 or (at your option) any later version — the same
++# terms as the file they modify.
++#
++# The unmodified original is ComfyUI commit
++# 3c1b7a17fdf239d35ce98cc777756f572d089795 (tag v0.39.2), from
++# https://github.com/comfyanonymous/ComfyUI
++#
++# `make comfy-source` reproduces the complete corresponding source of this
++# modified ComfyUI as a standalone bundle.
++# =============================================================================
++
+ from __future__ import annotations
+ 
+ import psutil
+@@ -346,9 +372,17 @@ def get_total_memory(dev=None, torch_total_too=False):
+         else:
+             stats = torch.cuda.memory_stats(dev)
+             mem_reserved = stats['reserved_bytes.all.current']
+-            _, mem_total_cuda = torch.cuda.mem_get_info(dev)
+             mem_total_torch = mem_reserved
+-            mem_total = mem_total_cuda
++            if UNIFIED_MEMORY:
++                # `comfy.system_memory` is cgroup-aware, so on
++                # a capped container the device total becomes the cap. That is
++                # the honest budget — the appliance runs vLLM and two audio
++                # engines in this same pool, and the driver's 121 GB is memory
++                # this process is not entitled to.
++                mem_total = comfy.system_memory.virtual_memory_total()
++            else:
++                _, mem_total_cuda = torch.cuda.mem_get_info(dev)
++                mem_total = mem_total_cuda
+ 
+     if torch_total_too:
+         return (mem_total, mem_total_torch)
+@@ -361,9 +395,57 @@ def mac_version():
+     except:
+         return None
+ 
++# --- comfyui-patch: GB10 unified memory ----------------------------------------
++# docs/phase-1.md §5.1, §8.2. On Grace-Blackwell the CPU and the GPU share one
++# physical memory pool. Several policies below were written for a discrete
++# card, where VRAM and system RAM are separate budgets and moving a tensor
++# between them genuinely frees device pages. Here both premises are false:
++#   - the budget is not total_vram + total_ram (~243 GB on a 121 GB box);
++#   - "offload to CPU" frees no physical page, it only changes allocator.
++# Left uncorrected, ComfyUI never evicts anything and the render peak is the
++# sum of every stage rather than the largest one.
++#
++# Detected rather than configured, because a wrong answer here is silent:
++# everything still runs, just with a memory plan built on a false premise.
++# `is_integrated` is the direct signal (1 on GB10); the ratio test is the
++# fallback, and no discrete card can coincide with host RAM to within 10%.
++def _gb10_unified_memory():
++    override = os.environ.get("COMFY_GB10_UNIFIED_MEMORY", "auto").strip().lower()
++    if override in ("0", "false", "off", "no"):
++        return False
++    if override in ("1", "true", "on", "yes"):
++        return True
++    if cpu_state != CPUState.GPU or directml_enabled:
++        return False
++    try:
++        props = torch.cuda.get_device_properties(get_torch_device())
++    except Exception:
++        return False
++    if getattr(props, "is_integrated", 0):
++        return True
++    # Deliberately psutil's host total and not system_memory's cgroup-aware
++    # one: under a §5.3 memory cap the capped figure would not match the
++    # device total, and unified memory would go undetected exactly where it
++    # matters most.
++    host_total = psutil.virtual_memory().total
++    if host_total <= 0:
++        return False
++    return 0.90 <= (props.total_memory / host_total) <= 1.10
++
++
++UNIFIED_MEMORY = _gb10_unified_memory()
++
+ total_vram = get_total_memory(get_torch_device()) / (1024 * 1024)
+ total_ram = comfy.system_memory.virtual_memory_total() / (1024 * 1024)
+-logging.info("Total VRAM {:0.0f} MB, total RAM {:0.0f} MB".format(total_vram, total_ram))
++if UNIFIED_MEMORY:
++    logging.info(
++        "Unified memory detected: one pool of {:0.0f} MB, not {:0.0f} MB of VRAM "
++        "plus {:0.0f} MB of RAM".format(min(total_vram, total_ram), total_vram, total_ram)
++    )
++else:
++    logging.info(
++        "Total VRAM {:0.0f} MB, total RAM {:0.0f} MB".format(total_vram, total_ram)
++    )
+ cgroup_ram_limit = comfy.system_memory.cgroup_memory_limit()
+ if cgroup_ram_limit is not None:
+     logging.info("RAM limited by cgroup to {:0.0f} MB (host has {:0.0f} MB)".format(cgroup_ram_limit / (1024 * 1024), psutil.virtual_memory().total / (1024 * 1024)))
+@@ -1123,6 +1205,19 @@ def unet_inital_load_device(parameters, dtype):
+ 
+     model_size = dtype_size(dtype) * parameters
+ 
++    if UNIFIED_MEMORY:
++        # `mem_dev > mem_cpu` compares one pool against itself,
++        # so on GB10 it decides on noise. Worse, picking the CPU means the
++        # weights are materialised in host pages and copied to device pages
++        # later — within the same DRAM. For a 20 GB UNET that is a pointless
++        # 20 GB memcpy whose transient footprint is 40 GB, which is a real
++        # risk to the §5.1 budget rather than a theoretical one. Load once,
++        # where the compute is.
++        mem_dev = get_free_memory(torch_dev)
++        if model_size < mem_dev - minimum_inference_memory():
++            return torch_dev
++        return cpu_dev
++
+     mem_dev = get_free_memory(torch_dev)
+     mem_cpu = get_free_memory(cpu_dev)
+     if mem_dev > mem_cpu and model_size < mem_dev:
+@@ -1845,9 +1940,27 @@ def get_free_memory(dev=None, torch_free_too=False):
+             stats = torch.cuda.memory_stats(dev)
+             mem_active = stats['active_bytes.all.current']
+             mem_reserved = stats['reserved_bytes.all.current']
+-            mem_free_cuda, _ = torch.cuda.mem_get_info(dev)
+             mem_free_torch = mem_reserved - mem_active
+-            mem_free_total = mem_free_cuda + mem_free_torch
++            if UNIFIED_MEMORY:
++                # The driver's free figure counts reclaimable
++                # page cache as used, so reading a 20 GB checkpoint collapses
++                # "free VRAM" by 20 GB that an allocation could have had for
++                # the asking. Measured on this hardware: 39.3 GB reported free
++                # against 117.7 GB actually available, the whole gap being page
++                # cache.
++                #
++                # The problem is not that the number is pessimistic — it is
++                # that it has no stable relationship to what an allocation can
++                # get, so every policy built on it (which weights to keep
++                # resident, when to evict) decides differently depending on
++                # what was last read from disk. The same render would plan
++                # differently twice in a row.
++                mem_free_total = (
++                    comfy.system_memory.virtual_memory_available() + mem_free_torch
++                )
++            else:
++                mem_free_cuda, _ = torch.cuda.mem_get_info(dev)
++                mem_free_total = mem_free_cuda + mem_free_torch
+ 
+     if torch_free_too:
+         return (mem_free_total, mem_free_torch)

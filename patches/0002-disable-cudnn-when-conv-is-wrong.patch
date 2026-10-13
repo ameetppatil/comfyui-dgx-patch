@@ -1,0 +1,77 @@
+diff --git a/comfy/model_management.py b/comfy/model_management.py
+index 13b690bd..4aa1c6ce 100644
+--- a/comfy/model_management.py
++++ b/comfy/model_management.py
+@@ -570,6 +570,72 @@ try:
+ except:
+     logging.warning("Warning, could not set allow_fp16_bf16_reduction_math_sdp")
+ 
++# --- comfyui-patch: cuDNN convolution can be silently WRONG here -----------------
++# docs/phase-1.md §8.2, docs/spike-findings.md §8a. Measured on a GB10 with
++# cuDNN 9.2.5 / CUDA 13.4 (nvcr.io/nvidia/vllm:26.08-py3), against a float64
++# CPU reference (spike/probes/torch_ops_probe.py):
++#
++#     conv2d  bf16   relative error 1.42      <- not precision loss; wrong
++#     conv3d  bf16   relative error 1.42
++#     conv3d  fp32   relative error 1.41
++#     matmul, sdpa, grouped conv, group_norm, interpolate   all correct
++#
++# It does not raise. It returns a plausible tensor of the right shape and
++# dtype containing the wrong numbers, so the first symptom is an output image
++# that looks like television static, several stages downstream of the cause.
++#
++# **This is a property of the cuDNN build, not of the architecture.** The same
++# GB10 with cuDNN 9.2.0 / CUDA 13.0 computes every one of these correctly. So
++# the test below is the computation itself rather than a device-capability
++# match: a capability check would keep disabling cuDNN on hardware where it
++# had been fixed, and would miss the same defect on a different device.
++# It costs one 32x32 convolution at import.
++#
++# PyTorch's own convolution kernels are correct on the affected build (error
++# ~3e-3 in bf16, i.e. ordinary rounding), so disabling cuDNN fixes it.
++#
++# `torch.backends.cudnn.benchmark = True` also appears to fix it, and must not
++# be used: benchmark mode chooses an algorithm by *timing*, so whether a
++# correct one is selected varies between runs of the same workload. It was
++# observed to pass and then fail on consecutive runs of the same probe. A
++# workaround whose correctness is decided by a stopwatch will be intermittent
++# in the field, which is worse than the bug.
++def _gb10_cudnn_conv_is_correct():
++    """Does cuDNN actually compute a convolution on this box? One small test."""
++    try:
++        dev = torch.device("cuda")
++        x = torch.randn(1, 8, 32, 32)
++        w = torch.randn(8, 8, 3, 3) * 0.05
++        reference = torch.nn.functional.conv2d(x.double(), w.double(), padding=1)
++        with torch.backends.cudnn.flags(enabled=True):
++            got = torch.nn.functional.conv2d(
++                x.to(dev, torch.bfloat16), w.to(dev, torch.bfloat16), padding=1
++            )
++        got = got.double().cpu()
++        error = (got - reference).abs().mean() / reference.abs().mean().clamp_min(1e-12)
++        # bf16 rounding lands near 3e-3; a wrong kernel lands near 1.4. Any
++        # threshold between the two works, so this is not a tuned constant.
++        return bool(torch.isfinite(got).all() and error < 0.05)
++    except Exception as e:
++        logging.warning("could not test cuDNN convolution, leaving it enabled: %s", e)
++        return True
++
++
++if (
++    os.environ.get("COMFY_GB10_FORCE_CUDNN", "").strip().lower() not in ("1", "true", "yes")
++    and torch.cuda.is_available()
++    and not _gb10_cudnn_conv_is_correct()
++):
++    torch.backends.cudnn.enabled = False
++    logging.warning(
++        "cuDNN disabled: it returns INCORRECT convolution results in this "
++        "build (cuDNN %s, torch %s, %s). PyTorch native kernels are correct. "
++        "Set COMFY_GB10_FORCE_CUDNN=1 to override and re-test.",
++        torch.backends.cudnn.version(),
++        torch.__version__,
++        torch.cuda.get_device_name(0),
++    )
++
+ if args.lowvram:
+     set_vram_to = VRAMState.LOW_VRAM
+     lowvram_available = True
